@@ -5,6 +5,7 @@ What it does
 ------------
 • Swipe through Liked Songs with KEEP / REMOVE / SKIP / KEEP→Keepers / ⭐ FAVOURITE.
 • Undo last action, hotkeys, filters, shuffle, progress & ETA, CSV export.
+• Live progress while building the queue (loading + filtering stages).
 • Robust Spotify rate-limit backoff.
 • Works with Streamlit Cloud secrets or local .env.
 
@@ -154,56 +155,104 @@ def ensure_playlist(sp: Spotify, name_key: str, id_key: str, name_val: str) -> s
     save_state(state)
     return created["id"]
 
-def fetch_all_liked_ids(sp: Spotify) -> List[str]:
+def fetch_all_liked_ids(sp: Spotify,
+                        progress: Optional[st.delta_generator.DeltaGenerator] = None,
+                        status: Optional[st.delta_generator.DeltaGenerator] = None) -> List[str]:
+    """Fetch all liked track IDs, updating a progress bar + status if provided."""
     ids: List[str] = []
     offset = 0
+    total = None
     while True:
         batch = sp_call(lambda: sp.current_user_saved_tracks(limit=PAGE_SIZE, offset=offset))
+        if total is None:
+            total = max(1, batch.get("total", 0))  # avoid div by zero
         items = batch.get("items", [])
         if not items:
             break
         ids.extend(t["track"]["id"] for t in items if t.get("track") and t["track"].get("id"))
         offset += len(items)
-        if offset >= batch.get("total", 0):
+
+        if progress:
+            progress.progress(min(offset / total, 1.0))
+        if status:
+            status.write(f"Loading liked songs… **{min(offset, total):,}/{total:,}**")
+
+        if offset >= total:
             break
     return ids
 
-def refill_queue(sp: Spotify, *, shuffle: bool, filters: Dict) -> None:
+def apply_filters_with_progress(sp: Spotify,
+                                liked_ids: List[str],
+                                filters: Dict,
+                                progress: Optional[st.delta_generator.DeltaGenerator] = None,
+                                status: Optional[st.delta_generator.DeltaGenerator] = None) -> List[str]:
+    """Filter liked IDs with live progress; returns filtered list."""
+    if not any(filters.values()):
+        return liked_ids
+
+    total_chunks = max(1, (len(liked_ids) + 49) // 50)
+    filtered: List[str] = []
+    for idx, i in enumerate(range(0, len(liked_ids), 50), start=1):
+        chunk = liked_ids[i : i + 50]
+        tracks = sp_call(lambda: sp.tracks(chunk))["tracks"]
+        for tr in tracks:
+            if tr is None:
+                continue
+            name = (tr.get("name") or "").lower()
+            artists_names = ", ".join(a["name"] for a in tr.get("artists", []))
+            album = (tr.get("album", {}).get("name") or "")
+            year = (tr.get("album", {}).get("release_date") or "")[:4]
+            ok = True
+            if filters.get("term"):
+                term = filters["term"].lower()
+                ok &= (term in name) or (term in artists_names.lower()) or (term in album.lower())
+            if filters.get("artist"):
+                ok &= filters["artist"].lower() in artists_names.lower()
+            if filters.get("year"):
+                ok &= year == str(filters["year"]).strip()
+            if ok:
+                filtered.append(tr["id"])
+
+        if progress:
+            progress.progress(min(idx / total_chunks, 1.0))
+        if status:
+            status.write(f"Filtering… **{idx:,}/{total_chunks:,}**")
+
+    return filtered
+
+def build_queue(sp: Spotify, *, shuffle: bool, filters: Dict,
+                progress: Optional[st.delta_generator.DeltaGenerator] = None,
+                status: Optional[st.delta_generator.DeltaGenerator] = None) -> Tuple[int, int]:
+    """Build the swipe queue (with progress UI if provided). Returns (queued_count, total_seen_plus_queued)."""
     state = load_state()
-    liked_ids = fetch_all_liked_ids(sp)
+
+    # Stage 1: load all liked IDs with progress
+    if status:
+        status.write("Loading liked songs…")
+    liked_ids = fetch_all_liked_ids(sp, progress=progress, status=status)
+
+    # Drop already seen
     liked_ids = [tid for tid in liked_ids if tid not in state["seen"]]
 
+    # Stage 2: filtering (if any)
     if any(filters.values()):
-        filtered: List[str] = []
-        for i in range(0, len(liked_ids), 50):
-            chunk = liked_ids[i : i + 50]
-            tracks = sp_call(lambda: sp.tracks(chunk))["tracks"]
-            for tr in tracks:
-                if tr is None:
-                    continue
-                name = (tr.get("name") or "").lower()
-                artists_names = ", ".join(a["name"] for a in tr.get("artists", []))
-                album = (tr.get("album", {}).get("name") or "")
-                year = (tr.get("album", {}).get("release_date") or "")[:4]
-                ok = True
-                if filters.get("term"):
-                    term = filters["term"].lower()
-                    ok &= (term in name) or (term in artists_names.lower()) or (term in album.lower())
-                if filters.get("artist"):
-                    ok &= filters["artist"].lower() in artists_names.lower()
-                if filters.get("year"):
-                    ok &= year == str(filters["year"]).strip()
-                if ok:
-                    filtered.append(tr["id"])
-        liked_ids = filtered
+        if status:
+            status.write("Filtering…")
+        if progress:
+            progress.progress(0.0)
+        liked_ids = apply_filters_with_progress(sp, liked_ids, filters, progress=progress, status=status)
 
+    # Shuffle + save
     if shuffle:
         random.shuffle(liked_ids)
-
     state["queue"] = liked_ids
     state["queue_built_total"] = len(liked_ids) + len(state["seen"])
     state["session_start"] = time.time()
     save_state(state)
+
+    queued = len(liked_ids)
+    total = state["queue_built_total"]
+    return queued, total
 
 def get_track(sp: Spotify, tid: str) -> Optional[dict]:
     try:
@@ -337,9 +386,22 @@ with st.expander("⚙️ Options", expanded=False):
         state["favourites_playlist_id"] = None
         save_state(state)
 
+    # Build with live progress + status
     if st.button("Build/Refresh Queue"):
-        refill_queue(sp, shuffle=shuffle, filters={"term": term, "artist": artist, "year": year})
-        st.success("Queue built from your current Liked Songs.")
+        status = st.empty()
+        progress = st.progress(0.0)
+        with st.spinner("Building your queue…"):
+            queued, total = build_queue(
+                sp,
+                shuffle=shuffle,
+                filters={"term": term, "artist": artist, "year": year},
+                progress=progress,
+                status=status,
+            )
+        if queued > 0:
+            st.success(f"✅ Queue built successfully — {queued:,} songs ready to swipe (out of {total:,} total).")
+        else:
+            st.warning("No new songs found to queue — all liked songs may have already been processed.")
 
 if not state.get("queue"):
     st.info("No queue yet — click **Build/Refresh Queue** above to begin.")
@@ -362,7 +424,8 @@ if not track:
 render_track_card(track)
 curr_artists = ", ".join(a["name"] for a in track.get("artists", []))
 if st.button(f"🎯 Filter queue to artist: {curr_artists}"):
-    refill_queue(sp, shuffle=True, filters={"term": "", "artist": curr_artists, "year": ""})
+    # Rebuild quickly (no progress UI here to keep it snappy)
+    build_queue(sp, shuffle=True, filters={"term": "", "artist": curr_artists, "year": ""})
     st.rerun()
 
 # Action buttons
@@ -491,7 +554,7 @@ if processed and state.get("session_start", 0.0) > 0:
 st.caption("Hotkeys: K Keep • R Remove • P Keepers • F Favourite • S Skip • U Undo • ? Help")
 st.caption(f"Processed: **{processed}/{total}** • Remaining: **{remaining}**{eta_txt}")
 
-# Export decisions
+# Export actions
 def build_actions_csv(seen: Dict) -> str:
     rows = ["track_id,action,timestamp"]
     for tid, info in seen.items():
