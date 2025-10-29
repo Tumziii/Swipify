@@ -1,26 +1,26 @@
 """
-Spotify Liked Songs — Swipe/Triage App (Streamlit + Spotipy)
+Spotify Liked Songs — Swipe/Triage (Streamlit + Spotipy)
 
-What this does
----------------
-A super-fast, Tinder-style triage for your 6,000+ Liked Songs:
-• Shows one track at a time with artwork + 30s preview (when available).
-• Buttons: KEEP, REMOVE (un-like), SKIP, KEEP → Keepers playlist, and ⭐ FAVOURITE → Favourites playlist.
-• Persists progress locally so you can stop and resume anytime.
-• Filters (year/artist/text) and shuffle mode to reduce bias.
-• ↩️ Undo Last Action (re-like, remove from Keepers/Favourites, restore queue).
-• ⌨️ Hotkeys — K=Keep, R=Remove, P=Keepers, F=Favourite, S=Skip, U=Undo, ?=Help.
-• ⏳ Progress bar + rough ETA.
-• ⤓ Export decisions as CSV.
-• 🎯 One-click “Filter to current artist”.
-• 🌓 Theme toggle (Light/Dark).
-• 🛡️ Rate-limit backoff (auto-retry on 429 & transient errors).
+Features
+--------
+• Tinder-style triage for your Liked Songs.
+• Actions: KEEP, REMOVE (unlike), SKIP, KEEP → Keepers, ⭐ FAVOURITE → Favourites.
+• Undo last action.
+• Shuffle + text/artist/year filters.
+• Progress bar + ETA, decisions CSV export.
+• Hotkeys: K/R/P/F/S/U, ? for help.
+• Dark theme toggle.
+• Rate-limit backoff for Spotify (429/5xx).
+• Works with Streamlit Cloud secrets or local .env.
 
-Requirements
-------------
-pip install streamlit spotipy python-dotenv requests
+Secrets (Streamlit Cloud)
+-------------------------
+SPOTIPY_CLIENT_ID = "..."
+SPOTIPY_CLIENT_SECRET = "..."
+SPOTIPY_REDIRECT_URI = "https://<your-app>.streamlit.app/callback"
 
-.env in the same folder:
+Local .env (optional for running locally)
+----------------------------------------
 SPOTIPY_CLIENT_ID=...
 SPOTIPY_CLIENT_SECRET=...
 SPOTIPY_REDIRECT_URI=http://127.0.0.1:8501/callback
@@ -32,14 +32,13 @@ import random
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Callable, Any
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import streamlit as st
 import streamlit.components.v1 as components
 from spotipy import Spotify
 from spotipy.oauth2 import SpotifyOAuth
 from spotipy.exceptions import SpotifyException
-from dotenv import load_dotenv
 
 # ---------- Config ----------
 STATE_FILE = Path("triage_state.json")
@@ -52,13 +51,20 @@ SCOPES = [
     "playlist-modify-private",
 ]
 
-# ---------- Helpers ----------
+# ---------- Env / Auth ----------
 @st.cache_data(show_spinner=False)
 def load_env() -> Tuple[str, str, str]:
-    load_dotenv()
-    cid = os.getenv("SPOTIPY_CLIENT_ID", "").strip()
-    secret = os.getenv("SPOTIPY_CLIENT_SECRET", "").strip()
-    redirect = os.getenv("SPOTIPY_REDIRECT_URI", "").strip()
+    # Prefer Streamlit secrets (cloud), fall back to .env (local)
+    if "SPOTIPY_CLIENT_ID" in st.secrets:
+        cid = st.secrets["SPOTIPY_CLIENT_ID"]
+        secret = st.secrets["SPOTIPY_CLIENT_SECRET"]
+        redirect = st.secrets["SPOTIPY_REDIRECT_URI"]
+    else:
+        from dotenv import load_dotenv  # local only
+        load_dotenv()
+        cid = os.getenv("SPOTIPY_CLIENT_ID", "").strip()
+        secret = os.getenv("SPOTIPY_CLIENT_SECRET", "").strip()
+        redirect = os.getenv("SPOTIPY_REDIRECT_URI", "").strip()
     return cid, secret, redirect
 
 @st.cache_resource(show_spinner=False)
@@ -71,11 +77,12 @@ def get_spotify_client() -> Spotify:
         client_secret=secret,
         redirect_uri=redirect,
         scope=" ".join(SCOPES),
-        cache_path=str(Path(".cache_spotify_swipe")),
+        cache_path=str(Path(".cache_spotify_swipe")),  # per-deployment token cache
         show_dialog=False,
     )
     return Spotify(auth_manager=auth)
 
+# ---------- State ----------
 def now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
 
@@ -96,20 +103,20 @@ def load_state() -> Dict:
         "queue_built_total": 0,
         "session_start": 0.0,
         "theme_dark": False,
+        "triaged_today": 0,
+        "triaged_day": datetime.utcnow().strftime("%Y-%m-%d"),
     }
 
 def save_state(state: Dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
-# --- Rate-limit/backoff wrapper ---
+# ---------- Backoff wrapper ----------
 def sp_call(fn: Callable[[], Any], *, max_tries: int = 5) -> Any:
-    """Call a Spotify API function with exponential backoff on 429 / transient errors."""
     delay = 1.0
-    for attempt in range(1, max_tries + 1):
+    for _ in range(max_tries - 1):
         try:
             return fn()
         except SpotifyException as e:
-            # 429 rate limit
             if e.http_status == 429:
                 retry_after = 0
                 try:
@@ -117,23 +124,18 @@ def sp_call(fn: Callable[[], Any], *, max_tries: int = 5) -> Any:
                 except Exception:
                     pass
                 time.sleep(retry_after if retry_after > 0 else delay)
-                delay *= 2
-                continue
-            # Transient 5xx or 502/503/504
-            if e.http_status in (500, 502, 503, 504):
+            elif e.http_status in (500, 502, 503, 504):
                 time.sleep(delay)
-                delay *= 2
-                continue
-            raise
+            else:
+                raise
         except Exception:
             time.sleep(delay)
-            delay *= 2
-    # Final attempt without catching to surface error
-    return fn()
+        delay = min(delay * 2, 16)
+    return fn()  # final attempt
 
+# ---------- Spotify helpers ----------
 def ensure_playlist(sp: Spotify, name_key: str, id_key: str, name_val: str) -> str:
     state = load_state()
-    # Name change invalidates cached id
     if state.get(name_key) != name_val:
         state[id_key] = None
         state[name_key] = name_val
@@ -209,12 +211,13 @@ def refill_queue(sp: Spotify, *, shuffle: bool, filters: Dict) -> None:
     state["session_start"] = time.time()
     save_state(state)
 
-def get_track(sp: Spotify, track_id: str) -> Optional[dict]:
+def get_track(sp: Spotify, tid: str) -> Optional[dict]:
     try:
-        return sp_call(lambda: sp.track(track_id))
+        return sp_call(lambda: sp.track(tid))
     except Exception:
         return None
 
+# ---------- UI helpers ----------
 def render_track_card(tr: dict) -> None:
     name = tr.get("name", "Unknown")
     artists = ", ".join(a["name"] for a in tr.get("artists", []))
@@ -223,7 +226,7 @@ def render_track_card(tr: dict) -> None:
     art_url = images[0]["url"] if images else None
     preview = tr.get("preview_url")
 
-    col1, col2 = st.columns([1, 2])
+    col1, col2 = st.columns([1, 2], gap="large")
     with col1:
         if art_url:
             st.image(art_url, use_container_width=True)
@@ -241,82 +244,83 @@ def render_track_card(tr: dict) -> None:
         st.caption(f"Duration: {mins}:{secs:02d} • Popularity: {tr.get('popularity', '–')}")
         st.link_button("Open in Spotify", tr.get("external_urls", {}).get("spotify", "#"))
 
-# --- Spotify actions (with retries) ---
-def action_remove(sp: Spotify, tid: str):
-    sp_call(lambda: sp.current_user_saved_tracks_delete([tid]))
-
-def action_readd(sp: Spotify, tid: str):
-    sp_call(lambda: sp.current_user_saved_tracks_add([tid]))
-
-def action_add_to_playlist(sp: Spotify, tid: str, playlist_id: str):
-    sp_call(lambda: sp.playlist_add_items(playlist_id, [tid]))
-
-def action_remove_from_playlist(sp: Spotify, tid: str, playlist_id: str):
-    sp_call(lambda: sp.playlist_remove_all_occurrences_of_items(playlist_id, [tid]))
+def action_remove(sp: Spotify, tid: str):                   sp_call(lambda: sp.current_user_saved_tracks_delete([tid]))
+def action_readd(sp: Spotify, tid: str):                    sp_call(lambda: sp.current_user_saved_tracks_add([tid]))
+def action_add_to_playlist(sp: Spotify, tid: str, pid: str): sp_call(lambda: sp.playlist_add_items(pid, [tid]))
+def action_remove_from_playlist(sp: Spotify, tid: str, pid: str):
+    sp_call(lambda: sp.playlist_remove_all_occurrences_of_items(pid, [tid]))
 
 def fast_head_count(sp: Spotify) -> int:
     batch = sp_call(lambda: sp.current_user_saved_tracks(limit=1))
     return batch.get("total", 0)
 
-# ---------- UI ----------
+# ---------- App ----------
 st.set_page_config(page_title="Spotify Liked Songs — Swipe/Triage", page_icon="💚", layout="centered")
 st.title("Spotify Liked Songs — Swipe/Triage")
 st.caption("Keep, remove, or file to Keepers/Favourites. Built with Streamlit + Spotipy.")
 
 cid, secret, redirect = load_env()
 if not (cid and secret and redirect):
-    st.error("Missing Spotify credentials. Create a .env with SPOTIPY_CLIENT_ID, SPOTIPY_CLIENT_SECRET, SPOTIPY_REDIRECT_URI.")
+    st.error("Missing Spotify credentials. Add SPOTIPY_CLIENT_ID, SPOTIPY_CLIENT_SECRET, SPOTIPY_REDIRECT_URI via Streamlit secrets.")
     st.stop()
 
 sp = get_spotify_client()
 state = load_state()
 
-# --- Theme toggle (CSS) ---
+# Theme toggle
 with st.sidebar:
     dark = st.checkbox("🌓 Dark theme", value=state.get("theme_dark", False))
     if dark != state.get("theme_dark"):
         state["theme_dark"] = dark
         save_state(state)
-        st.experimental_rerun()
+        st.rerun()
+    st.markdown("---")
+    # Daily triage metric
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    if state.get("triaged_day") != today:
+        state["triaged_day"] = today
+        state["triaged_today"] = 0
+        save_state(state)
+    st.metric("Triaged today", state.get("triaged_today", 0))
 
 if state.get("theme_dark"):
     st.markdown("""
         <style>
-        html, body, [data-testid="stAppViewContainer"] {
-            background: #0e1117 !important; color: #e0e0e0 !important;
-        }
-        .stButton>button { background:#1f2937 !important; color:#e0e0e0 !important; border:1px solid #334155 !important; }
-        .stDownloadButton>button { background:#1f2937 !important; color:#e0e0e0 !important; border:1px solid #334155 !important; }
+        html, body, [data-testid="stAppViewContainer"] { background:#0e1117 !important; color:#e5e7eb !important; }
+        .stButton>button, .stDownloadButton>button { background:#1f2937 !important; color:#e5e7eb !important; border:1px solid #334155 !important; }
         .stTextInput>div>div>input, .stTextArea textarea { background:#111827 !important; color:#e5e7eb !important; }
         .stExpander { background:#0b1220 !important; }
+        audio { width: 100%; }
         </style>
     """, unsafe_allow_html=True)
 
-# --- Hotkeys (K,R,P,F,S,U,? help) ---
+# Hotkeys (uses JS to append ?hotkey=...)
 components.html(
     """
     <script>
-    const map = { 'k':'keep', 'r':'remove', 'p':'keepers', 'f':'favourite', 's':'skip', 'u':'undo', '?':'help' };
-    document.addEventListener('keydown', (e) => {
-      const a = map[e.key.toLowerCase()];
-      if (!a) return;
-      const t = document.activeElement && document.activeElement.tagName;
-      if (t === 'INPUT' || t === 'TEXTAREA') return;
-      const url = new URL(window.location);
-      url.searchParams.set('hotkey', a);
-      url.searchParams.set('_', Date.now());
-      window.location = url;
-    });
+      const map = { 'k':'keep','r':'remove','p':'keepers','f':'favourite','s':'skip','u':'undo','?':'help' };
+      document.addEventListener('keydown', (e) => {
+        const a = map[e.key.toLowerCase()];
+        if (!a) return;
+        const t = document.activeElement?.tagName;
+        if (t === 'INPUT' || t === 'TEXTAREA') return;
+        const url = new URL(window.location);
+        url.searchParams.set('hotkey', a);
+        url.searchParams.set('_', Date.now());
+        window.location = url;
+      });
     </script>
     """,
     height=0,
 )
 
-params = st.experimental_get_query_params()
-hotkey_action = params.get("hotkey", [None])[0]
+params = st.query_params
+hotkey_action = params.get("hotkey")
 if hotkey_action:
-    st.experimental_set_query_params()
+    # clear so it doesn't repeat on rerun
+    st.query_params.clear()
 
+# Options
 with st.expander("⚙️ Options", expanded=False):
     shuffle = st.checkbox("Shuffle order", value=True)
     colf1, colf2, colf3 = st.columns(3)
@@ -354,7 +358,7 @@ if not state.get("queue"):
         pass
     st.stop()
 
-# Current item
+# Current track
 current_id = state["queue"][0]
 track = get_track(sp, current_id)
 if not track:
@@ -363,14 +367,13 @@ if not track:
     save_state(state)
     st.rerun()
 
-# Card + quick artist filter
 render_track_card(track)
 curr_artists = ", ".join(a["name"] for a in track.get("artists", []))
 if st.button(f"🎯 Filter queue to artist: {curr_artists}"):
     refill_queue(sp, shuffle=True, filters={"term": "", "artist": curr_artists, "year": ""})
     st.rerun()
 
-# Buttons row
+# Action buttons
 colk, cold, colp, colf, cols = st.columns(5)
 keep_clicked      = colk.button("✅ KEEP", use_container_width=True)
 remove_clicked    = cold.button("🗑️ REMOVE (unlike)", type="primary", use_container_width=True)
@@ -378,7 +381,7 @@ keepers_clicked   = colp.button("📁 KEEP → Keepers", use_container_width=Tru
 favourite_clicked = colf.button("⭐ FAVOURITE → Favourites", use_container_width=True)
 skip_clicked      = cols.button("⏭️ SKIP", use_container_width=True)
 
-# Apply hotkeys
+# Hotkeys apply
 if   hotkey_action == "keep":      keep_clicked = True
 elif hotkey_action == "remove":    remove_clicked = True
 elif hotkey_action == "keepers":   keepers_clicked = True
@@ -390,8 +393,14 @@ def record_action(a: str):
     seen[current_id] = {"action": a, "ts": now_iso()}
     state["seen"] = seen
     state["last_action"] = {"track_id": current_id, "action": a}
+    # daily metric
+    today = datetime.utcnow().strftime("%Y-%m-%d")
+    if state.get("triaged_day") != today:
+        state["triaged_day"] = today
+        state["triaged_today"] = 0
+    state["triaged_today"] = state.get("triaged_today", 0) + 1
 
-# Do actions
+# Actions
 if keep_clicked:
     record_action("keep")
     state["queue"].pop(0)
@@ -438,33 +447,34 @@ if skip_clicked:
     save_state(state)
     st.rerun()
 
-# --- Undo Feature ---
+# Undo
 st.divider()
 def undo_last_action(sp: Spotify, state: Dict):
     last = state.get("last_action")
     if not last:
         st.warning("No recent action to undo.")
         return
-    tid = last["track_id"]
-    action = last["action"]
+    tid = last["track_id"]; action = last["action"]
     try:
         if action == "remove":
             action_readd(sp, tid)
         elif action == "keepers":
-            pl_id = ensure_playlist(sp, "keepers_playlist_name", "keepers_playlist_id",
-                                    state.get("keepers_playlist_name", DEFAULT_KEEPERS_PLAYLIST_NAME))
-            action_remove_from_playlist(sp, tid, pl_id)
+            pid = ensure_playlist(sp, "keepers_playlist_name", "keepers_playlist_id",
+                                  state.get("keepers_playlist_name", DEFAULT_KEEPERS_PLAYLIST_NAME))
+            action_remove_from_playlist(sp, tid, pid)
         elif action == "favourite":
-            pl_id = ensure_playlist(sp, "favourites_playlist_name", "favourites_playlist_id",
-                                    state.get("favourites_playlist_name", DEFAULT_FAVOURITES_PLAYLIST_NAME))
-            action_remove_from_playlist(sp, tid, pl_id)
-        # For keep/skip: no Spotify mutation; just restore to front
+            pid = ensure_playlist(sp, "favourites_playlist_name", "favourites_playlist_id",
+                                  state.get("favourites_playlist_name", DEFAULT_FAVOURITES_PLAYLIST_NAME))
+            action_remove_from_playlist(sp, tid, pid)
+        # keep/skip just re-queue
         if tid in state["seen"]:
             del state["seen"][tid]
         if tid in state["queue"]:
             state["queue"].remove(tid)
         state["queue"].insert(0, tid)
         state["last_action"] = None
+        # don't count towards daily if undone
+        state["triaged_today"] = max(0, state.get("triaged_today", 0) - 1)
         save_state(state)
         st.success("✅ Last action undone.")
         st.rerun()
@@ -476,18 +486,19 @@ if undo_clicked or hotkey_action == "undo":
     undo_last_action(sp, state)
 
 # Progress + ETA
-processed = len(state["seen"])
+processed = len(state.get("seen", {}))
 remaining = len(state["queue"])
 total = state.get("queue_built_total", processed + remaining) or (processed + remaining)
 st.progress(0 if total == 0 else processed / total)
 eta_txt = ""
 if processed and state.get("session_start", 0.0) > 0:
     elapsed = max(time.time() - state["session_start"], 1)
-    pace = elapsed / processed  # seconds/decision
+    pace = elapsed / processed
     eta_s = int(pace * remaining)
     mins, secs = divmod(eta_s, 60)
     if mins or secs:
         eta_txt = f" • ETA ~{mins}m {secs}s at current pace"
+
 st.caption("Keys: K=Keep • R=Remove • P=Keepers • F=Favourite • S=Skip • U=Undo • ?=Help")
 st.caption(f"Processed: **{processed}/{total}** • Remaining: **{remaining}**{eta_txt}")
 
@@ -501,14 +512,14 @@ def build_decisions_csv(seen: Dict) -> str:
 csv_data = build_decisions_csv(state.get("seen", {})).encode("utf-8")
 st.download_button("⤓ Export decisions (CSV)", data=csv_data, file_name="triage_decisions.csv", mime="text/csv")
 
-# Help overlay
+# Help
 if hotkey_action == "help" or st.button("❓ Show hotkeys/help"):
     st.info(
         "Hotkeys:\n"
         "• K Keep\n• R Remove (un-like)\n• P Keep → Keepers\n• F Favourite → Favourites\n• S Skip\n• U Undo last action\n\n"
         "Tips:\n"
         "• Use Shuffle to avoid artist clumps.\n"
-        "• Use the artist filter button above to blitz one artist.\n"
+        "• Use the artist filter button to blitz one artist.\n"
         "• Export decisions anytime; local progress lives in triage_state.json."
     )
 
@@ -516,5 +527,5 @@ with st.expander("🧹 Utilities"):
     if st.button("Clear local state (does not affect Spotify)"):
         if STATE_FILE.exists():
             STATE_FILE.unlink()
-        st.experimental_set_query_params()
+        st.query_params.clear()
         st.success("Local state cleared. Reload the page.")
