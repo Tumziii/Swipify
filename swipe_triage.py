@@ -3,10 +3,10 @@ Swpify — Swipe your Spotify Liked Songs (Streamlit + Spotipy)
 
 What it does
 ------------
-• Swipe through Liked Songs with KEEP / REMOVE / SKIP / KEEP→Keepers / ⭐ FAVOURITE.
+• Swipe through Liked Songs with: KEEP / REMOVE / SKIP / KEEP→Keepers / ⭐ FAVOURITE.
 • Undo last action, hotkeys, filters, shuffle, progress & ETA, CSV export.
 • Live progress while building the queue (loading + filtering stages).
-• Robust Spotify rate-limit backoff.
+• Built-in Troubleshoot panel to verify Spotify auth and clear token cache.
 • Works with Streamlit Cloud secrets or local .env.
 
 Streamlit Secrets (Cloud)
@@ -41,15 +41,13 @@ STATE_FILE = Path("swpify_state.json")
 DEFAULT_KEEPERS_PLAYLIST_NAME = "💚 Keepers (Swpify)"
 DEFAULT_FAVOURITES_PLAYLIST_NAME = "⭐ Favourites (Swpify)"
 PAGE_SIZE = 50
-SCOPES = [
-    "user-library-read",
-    "user-library-modify",
-    "playlist-modify-private",
-]
+SCOPES = ["user-library-read", "user-library-modify", "playlist-modify-private"]
+
 
 # ---------- Env / Auth ----------
 @st.cache_data(show_spinner=False)
 def load_env() -> Tuple[str, str, str]:
+    """Load Spotify credentials from Streamlit secrets or local .env."""
     if "SPOTIPY_CLIENT_ID" in st.secrets:
         cid = st.secrets["SPOTIPY_CLIENT_ID"]
         secret = st.secrets["SPOTIPY_CLIENT_SECRET"]
@@ -61,6 +59,7 @@ def load_env() -> Tuple[str, str, str]:
         secret = os.getenv("SPOTIPY_CLIENT_SECRET", "").strip()
         redirect = os.getenv("SPOTIPY_REDIRECT_URI", "").strip()
     return cid, secret, redirect
+
 
 @st.cache_resource(show_spinner=False)
 def get_spotify_client() -> Spotify:
@@ -77,9 +76,11 @@ def get_spotify_client() -> Spotify:
     )
     return Spotify(auth_manager=auth)
 
+
 # ---------- State ----------
 def now_iso() -> str:
     return datetime.utcnow().isoformat(timespec="seconds") + "Z"
+
 
 def load_state() -> Dict:
     if STATE_FILE.exists():
@@ -102,11 +103,14 @@ def load_state() -> Dict:
         "swiped_day": datetime.utcnow().strftime("%Y-%m-%d"),
     }
 
+
 def save_state(state: Dict) -> None:
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
+
 # ---------- Backoff wrapper ----------
 def sp_call(fn: Callable[[], Any], *, max_tries: int = 5) -> Any:
+    """Spotify call with gentle backoff for rate limits and transient errors."""
     delay = 1.0
     for _ in range(max_tries - 1):
         try:
@@ -128,8 +132,10 @@ def sp_call(fn: Callable[[], Any], *, max_tries: int = 5) -> Any:
         delay = min(delay * 2, 16)
     return fn()  # final attempt
 
+
 # ---------- Spotify helpers ----------
 def ensure_playlist(sp: Spotify, name_key: str, id_key: str, name_val: str) -> str:
+    """Create/find a playlist by name for the current user; cache the id."""
     state = load_state()
     if state.get(name_key) != name_val:
         state[id_key] = None
@@ -149,19 +155,28 @@ def ensure_playlist(sp: Spotify, name_key: str, id_key: str, name_val: str) -> s
                 return pl["id"]
         results = sp_call(lambda: sp.next(results)) if results.get("next") else None
 
-    created = sp_call(lambda: sp.user_playlist_create(me, name_val, public=False,
-                                                      description="Saved via Swpify"))
+    created = sp_call(lambda: sp.user_playlist_create(
+        me, name_val, public=False, description="Saved via Swpify"
+    ))
     state[id_key] = created["id"]
     save_state(state)
     return created["id"]
 
-def fetch_all_liked_ids(sp: Spotify,
-                        progress: Optional[st.delta_generator.DeltaGenerator] = None,
-                        status: Optional[st.delta_generator.DeltaGenerator] = None) -> List[str]:
+
+def fetch_all_liked_ids(
+    sp: Spotify,
+    progress: Optional[st.delta_generator.DeltaGenerator] = None,
+    status: Optional[st.delta_generator.DeltaGenerator] = None,
+) -> List[str]:
     """Fetch all liked track IDs, updating a progress bar + status if provided."""
     ids: List[str] = []
     offset = 0
     total = None
+
+    # yield an immediate status line so users see action
+    if status:
+        status.write("Loading liked songs…")
+
     while True:
         batch = sp_call(lambda: sp.current_user_saved_tracks(limit=PAGE_SIZE, offset=offset))
         if total is None:
@@ -169,6 +184,7 @@ def fetch_all_liked_ids(sp: Spotify,
         items = batch.get("items", [])
         if not items:
             break
+
         ids.extend(t["track"]["id"] for t in items if t.get("track") and t["track"].get("id"))
         offset += len(items)
 
@@ -179,19 +195,27 @@ def fetch_all_liked_ids(sp: Spotify,
 
         if offset >= total:
             break
+
     return ids
 
-def apply_filters_with_progress(sp: Spotify,
-                                liked_ids: List[str],
-                                filters: Dict,
-                                progress: Optional[st.delta_generator.DeltaGenerator] = None,
-                                status: Optional[st.delta_generator.DeltaGenerator] = None) -> List[str]:
+
+def apply_filters_with_progress(
+    sp: Spotify,
+    liked_ids: List[str],
+    filters: Dict,
+    progress: Optional[st.delta_generator.DeltaGenerator] = None,
+    status: Optional[st.delta_generator.DeltaGenerator] = None,
+) -> List[str]:
     """Filter liked IDs with live progress; returns filtered list."""
     if not any(filters.values()):
         return liked_ids
 
+    if status:
+        status.write("Filtering…")
+
     total_chunks = max(1, (len(liked_ids) + 49) // 50)
     filtered: List[str] = []
+
     for idx, i in enumerate(range(0, len(liked_ids), 50), start=1):
         chunk = liked_ids[i : i + 50]
         tracks = sp_call(lambda: sp.tracks(chunk))["tracks"]
@@ -220,15 +244,19 @@ def apply_filters_with_progress(sp: Spotify,
 
     return filtered
 
-def build_queue(sp: Spotify, *, shuffle: bool, filters: Dict,
-                progress: Optional[st.delta_generator.DeltaGenerator] = None,
-                status: Optional[st.delta_generator.DeltaGenerator] = None) -> Tuple[int, int]:
+
+def build_queue(
+    sp: Spotify,
+    *,
+    shuffle: bool,
+    filters: Dict,
+    progress: Optional[st.delta_generator.DeltaGenerator] = None,
+    status: Optional[st.delta_generator.DeltaGenerator] = None,
+) -> Tuple[int, int]:
     """Build the swipe queue (with progress UI if provided). Returns (queued_count, total_seen_plus_queued)."""
     state = load_state()
 
     # Stage 1: load all liked IDs with progress
-    if status:
-        status.write("Loading liked songs…")
     liked_ids = fetch_all_liked_ids(sp, progress=progress, status=status)
 
     # Drop already seen
@@ -236,8 +264,6 @@ def build_queue(sp: Spotify, *, shuffle: bool, filters: Dict,
 
     # Stage 2: filtering (if any)
     if any(filters.values()):
-        if status:
-            status.write("Filtering…")
         if progress:
             progress.progress(0.0)
         liked_ids = apply_filters_with_progress(sp, liked_ids, filters, progress=progress, status=status)
@@ -254,11 +280,13 @@ def build_queue(sp: Spotify, *, shuffle: bool, filters: Dict,
     total = state["queue_built_total"]
     return queued, total
 
+
 def get_track(sp: Spotify, tid: str) -> Optional[dict]:
     try:
         return sp_call(lambda: sp.track(tid))
     except Exception:
         return None
+
 
 # ---------- UI helpers ----------
 def render_track_card(tr: dict) -> None:
@@ -287,15 +315,18 @@ def render_track_card(tr: dict) -> None:
         st.caption(f"Duration: {mins}:{secs:02d} • Popularity: {tr.get('popularity', '–')}")
         st.link_button("Open in Spotify", tr.get("external_urls", {}).get("spotify", "#"))
 
+
 def action_remove(sp: Spotify, tid: str):                   sp_call(lambda: sp.current_user_saved_tracks_delete([tid]))
 def action_readd(sp: Spotify, tid: str):                    sp_call(lambda: sp.current_user_saved_tracks_add([tid]))
 def action_add_to_playlist(sp: Spotify, tid: str, pid: str): sp_call(lambda: sp.playlist_add_items(pid, [tid]))
 def action_remove_from_playlist(sp: Spotify, tid: str, pid: str):
     sp_call(lambda: sp.playlist_remove_all_occurrences_of_items(pid, [tid]))
 
+
 def fast_head_count(sp: Spotify) -> int:
     batch = sp_call(lambda: sp.current_user_saved_tracks(limit=1))
     return batch.get("total", 0)
+
 
 # ---------- App ----------
 st.set_page_config(page_title="Swpify — Spotify Liked Songs", page_icon="💚", layout="centered")
@@ -310,7 +341,7 @@ if not (cid and secret and redirect):
 sp = get_spotify_client()
 state = load_state()
 
-# Theme toggle + daily stat
+# Sidebar: theme + daily counter
 with st.sidebar:
     dark = st.checkbox("🌓 Dark theme", value=state.get("theme_dark", False))
     if dark != state.get("theme_dark"):
@@ -326,8 +357,10 @@ with st.sidebar:
         save_state(state)
     st.metric("Swiped today", state.get("swiped_today", 0))
 
+# Dark theme CSS
 if state.get("theme_dark"):
-    st.markdown("""
+    st.markdown(
+        """
         <style>
         html, body, [data-testid="stAppViewContainer"] { background:#0e1117 !important; color:#e5e7eb !important; }
         .stButton>button, .stDownloadButton>button { background:#1f2937 !important; color:#e5e7eb !important; border:1px solid #334155 !important; }
@@ -335,7 +368,9 @@ if state.get("theme_dark"):
         .stExpander { background:#0b1220 !important; }
         audio { width: 100%; }
         </style>
-    """, unsafe_allow_html=True)
+        """,
+        unsafe_allow_html=True,
+    )
 
 # Hotkeys
 components.html(
@@ -361,7 +396,7 @@ hotkey_action = params.get("hotkey")
 if hotkey_action:
     st.query_params.clear()
 
-# Options
+# Options (build + filters)
 with st.expander("⚙️ Options", expanded=False):
     shuffle = st.checkbox("Shuffle order", value=True)
     colf1, colf2, colf3 = st.columns(3)
@@ -372,15 +407,19 @@ with st.expander("⚙️ Options", expanded=False):
     with colf3:
         year = st.text_input("Filter by year (YYYY)")
 
-    keepers_name = st.text_input("Keepers playlist name",
-                                 value=state.get("keepers_playlist_name", DEFAULT_KEEPERS_PLAYLIST_NAME))
+    keepers_name = st.text_input(
+        "Keepers playlist name",
+        value=state.get("keepers_playlist_name", DEFAULT_KEEPERS_PLAYLIST_NAME),
+    )
     if keepers_name != state.get("keepers_playlist_name"):
         state["keepers_playlist_name"] = keepers_name
         state["keepers_playlist_id"] = None
         save_state(state)
 
-    favourites_name = st.text_input("Favourites playlist name",
-                                    value=state.get("favourites_playlist_name", DEFAULT_FAVOURITES_PLAYLIST_NAME))
+    favourites_name = st.text_input(
+        "Favourites playlist name",
+        value=state.get("favourites_playlist_name", DEFAULT_FAVOURITES_PLAYLIST_NAME),
+    )
     if favourites_name != state.get("favourites_playlist_name"):
         state["favourites_playlist_name"] = favourites_name
         state["favourites_playlist_id"] = None
@@ -403,11 +442,57 @@ with st.expander("⚙️ Options", expanded=False):
         else:
             st.warning("No new songs found to queue — all liked songs may have already been processed.")
 
+# --- Troubleshoot panel -------------------------------------------------------
+with st.expander("🔧 Troubleshoot (Spotify connection)"):
+    colA, colB, colC = st.columns([1, 1, 2])
+    with colA:
+        test_btn = st.button("Test Spotify auth")
+    with colB:
+        clear_btn = st.button("Force re-auth (clear token)")
+    with colC:
+        quick_btn = st.button("Quick fetch 1 track")
+
+    if clear_btn:
+        cache_path = Path(".cache_spotify_swpify")
+        try:
+            if cache_path.exists():
+                cache_path.unlink()
+            st.success("Cleared cached token. Click 'Test Spotify auth' or 'Build/Refresh Queue' to re-auth.")
+        except Exception as e:
+            st.error(f"Could not clear token cache: {e}")
+
+    if test_btn:
+        try:
+            me = sp_call(lambda: sp.current_user())
+            st.success(f"✅ Auth OK. Logged in as **{me.get('display_name','(no name)')}** ({me.get('id')}).")
+        except Exception as e:
+            st.error("❌ Auth failed. See details below.")
+            st.exception(e)
+            st.info(
+                "Check: Secrets, Redirect URI, and that your account is added under "
+                "Users & Access (Spotify dashboard). Redirect must match your Streamlit app: "
+                "https://<your-app>.streamlit.app/callback"
+            )
+
+    if quick_btn:
+        try:
+            batch = sp_call(lambda: sp.current_user_saved_tracks(limit=1, offset=0))
+            total = batch.get("total", 0)
+            item = (batch.get("items") or [{}])[0]
+            track = (item.get("track") or {})
+            name = track.get("name", "(no name)")
+            artists = ", ".join(a["name"] for a in track.get("artists", []))
+            st.success(f"✅ API fetch OK. Library total ≈ {total:,}. First track: **{name}** — {artists}")
+        except Exception as e:
+            st.error("❌ Failed to fetch tracks. See details below.")
+            st.exception(e)
+
+# If nothing queued yet
 if not state.get("queue"):
     st.info("No queue yet — click **Build/Refresh Queue** above to begin.")
     try:
         total_est = fast_head_count(sp)
-        st.caption(f"You currently have approximately **{total_est}** Liked Songs.")
+        st.caption(f"You currently have approximately **{total_est:,}** Liked Songs.")
     except Exception:
         pass
     st.stop()
@@ -424,7 +509,6 @@ if not track:
 render_track_card(track)
 curr_artists = ", ".join(a["name"] for a in track.get("artists", []))
 if st.button(f"🎯 Filter queue to artist: {curr_artists}"):
-    # Rebuild quickly (no progress UI here to keep it snappy)
     build_queue(sp, shuffle=True, filters={"term": "", "artist": curr_artists, "year": ""})
     st.rerun()
 
@@ -436,7 +520,7 @@ keepers_clicked   = colp.button("📁 KEEP → Keepers", use_container_width=Tru
 favourite_clicked = colf.button("⭐ FAVOURITE → Favourites", use_container_width=True)
 skip_clicked      = cols.button("⏭️ SKIP", use_container_width=True)
 
-# Hotkeys
+# Hotkeys mapping
 if   hotkey_action == "keep":      keep_clicked = True
 elif hotkey_action == "remove":    remove_clicked = True
 elif hotkey_action == "keepers":   keepers_clicked = True
@@ -474,8 +558,10 @@ if remove_clicked:
 
 if keepers_clicked:
     try:
-        pl_id = ensure_playlist(sp, "keepers_playlist_name", "keepers_playlist_id",
-                                state.get("keepers_playlist_name", DEFAULT_KEEPERS_PLAYLIST_NAME))
+        pl_id = ensure_playlist(
+            sp, "keepers_playlist_name", "keepers_playlist_id",
+            state.get("keepers_playlist_name", DEFAULT_KEEPERS_PLAYLIST_NAME)
+        )
         action_add_to_playlist(sp, current_id, pl_id)
         record_action("keepers")
         state["queue"].pop(0)
@@ -486,8 +572,10 @@ if keepers_clicked:
 
 if favourite_clicked:
     try:
-        pl_id = ensure_playlist(sp, "favourites_playlist_name", "favourites_playlist_id",
-                                state.get("favourites_playlist_name", DEFAULT_FAVOURITES_PLAYLIST_NAME))
+        pl_id = ensure_playlist(
+            sp, "favourites_playlist_name", "favourites_playlist_id",
+            state.get("favourites_playlist_name", DEFAULT_FAVOURITES_PLAYLIST_NAME)
+        )
         action_add_to_playlist(sp, current_id, pl_id)
         record_action("favourite")
         state["queue"].pop(0)
@@ -504,6 +592,7 @@ if skip_clicked:
 
 # Undo
 st.divider()
+
 def undo_last_action(sp: Spotify, state: Dict):
     last = state.get("last_action")
     if not last:
@@ -562,8 +651,7 @@ def build_actions_csv(seen: Dict) -> str:
     return "\n".join(rows)
 
 csv_data = build_actions_csv(state.get("seen", {})).encode("utf-8")
-st.download_button("⤓ Export actions (CSV)", data=csv_data,
-                   file_name="swpify_actions.csv", mime="text/csv")
+st.download_button("⤓ Export actions (CSV)", data=csv_data, file_name="swpify_actions.csv", mime="text/csv")
 
 # Help
 if hotkey_action == "help" or st.button("❓ Show hotkeys/help"):
@@ -582,3 +670,4 @@ with st.expander("🧹 Utilities"):
             STATE_FILE.unlink()
         st.query_params.clear()
         st.success("Local state cleared. Reload the page.")
+
