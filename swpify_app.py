@@ -1,30 +1,30 @@
 """
 Swpify — Spotify Liked Songs (Streamlit + Spotipy)
 
-What you get
-------------
-• Build a swipe queue from your Liked Songs (with live progress).
+Features
+--------
+• Log in with Spotify via an in-app OAuth button (no console prompts).
+• Build a swipe queue from your Liked Songs (with live progress & filters).
 • Actions: KEEP / REMOVE (unlike) / → Keepers / → Favourites / SKIP / UNDO.
-• Optional filters (text / artist / year) + Shuffle.
-• Troubleshoot panel: test auth, clear token, quick fetch.
-• Minimal, robust code (no custom theming).
+• Shuffle, library size banner, and a small Troubleshoot panel.
 
 Cloud secrets (Streamlit)
 -------------------------
 SPOTIPY_CLIENT_ID = "..."
 SPOTIPY_CLIENT_SECRET = "..."
 SPOTIPY_REDIRECT_URI = "https://<your-app>.streamlit.app/callback"
+(Spotify Dashboard → Edit Settings → Redirect URIs must include that exact URL.)
 
-Local (optional) .env if testing locally
-----------------------------------------
+Local .env (optional for local dev)
+-----------------------------------
 SPOTIPY_CLIENT_ID=...
 SPOTIPY_CLIENT_SECRET=...
 SPOTIPY_REDIRECT_URI=http://127.0.0.1:8501/callback
 """
 
 from __future__ import annotations
-import json
 import os
+import json
 import random
 import time
 from pathlib import Path
@@ -38,14 +38,15 @@ from spotipy.oauth2 import SpotifyOAuth
 st.set_page_config(page_title="Swpify — Spotify Liked Songs", page_icon="🎧", layout="centered")
 
 # Session keys
-QUEUE = "queue_ids"
-SEEN = "seen_actions"          # {track_id: {"action": str, "ts": str}}
-LAST = "last_action_stack"     # list of {"id": str, "action": str, "payload": optional}
+QUEUE = "queue_ids"                    # List[str]
+SEEN = "seen_actions"                  # {track_id: {"action": str, "ts": str}}
+LAST = "last_action_stack"             # list of {"id": str, "action": str, "payload": optional}
 KEEPERS_ID = "keepers_playlist_id"
 FAVS_ID = "favs_playlist_id"
 BUILT = "queue_built_once"
 SWIPED_TODAY = "swiped_today_count"
 SWIPED_DATE = "swiped_today_ymd"
+TOKEN_INFO = "token_info"
 
 DEFAULT_KEEPERS = "Keepers (Swpify)"
 DEFAULT_FAVS = "Favourites (Swpify)"
@@ -82,29 +83,67 @@ def bump_swiped() -> None:
     ss[SWIPED_TODAY] = ss.get(SWIPED_TODAY, 0) + 1
 
 
-# ----------------------------- Auth / Client ----------------------------- #
+# ----------------------------- OAuth (explicit, in-app) ----------------------------- #
 def load_creds() -> Tuple[str, str, str]:
-    # Prefer Streamlit Cloud secrets; fall back to .env (optional local)
-    cid = st.secrets.get("SPOTIPY_CLIENT_ID", "").strip() if "SPOTIPY_CLIENT_ID" in st.secrets else os.getenv("SPOTIPY_CLIENT_ID", "").strip()
-    secret = st.secrets.get("SPOTIPY_CLIENT_SECRET", "").strip() if "SPOTIPY_CLIENT_SECRET" in st.secrets else os.getenv("SPOTIPY_CLIENT_SECRET", "").strip()
-    redirect = st.secrets.get("SPOTIPY_REDIRECT_URI", "").strip() if "SPOTIPY_REDIRECT_URI" in st.secrets else os.getenv("SPOTIPY_REDIRECT_URI", "").strip()
+    # Prefer Streamlit Secrets; fall back to env for local dev
+    cid = st.secrets.get("SPOTIPY_CLIENT_ID", os.getenv("SPOTIPY_CLIENT_ID", "")).strip()
+    secret = st.secrets.get("SPOTIPY_CLIENT_SECRET", os.getenv("SPOTIPY_CLIENT_SECRET", "")).strip()
+    redirect = st.secrets.get("SPOTIPY_REDIRECT_URI", os.getenv("SPOTIPY_REDIRECT_URI", "")).strip()
     if not (cid and secret and redirect):
         st.error("Missing Spotify credentials. Set SPOTIPY_CLIENT_ID / SPOTIPY_CLIENT_SECRET / SPOTIPY_REDIRECT_URI.")
         st.stop()
     return cid, secret, redirect
 
-@st.cache_resource(show_spinner=False)
-def get_spotify_client() -> Spotify:
+def ensure_spotify_client() -> Spotify:
+    """
+    Explicit web OAuth for Streamlit:
+    - Shows 'Log in with Spotify' button
+    - Handles callback ?code=...
+    - Stores token in session, refreshes when needed
+    """
     cid, secret, redirect = load_creds()
     auth = SpotifyOAuth(
         client_id=cid,
         client_secret=secret,
-        redirect_uri=redirect,
+        redirect_uri=redirect,  # e.g. https://swpify-app.streamlit.app/callback
         scope=SCOPES,
-        cache_path=".cache_swpify_token",
+        cache_path=None,        # avoid file cache on Streamlit Cloud
+        open_browser=False,     # don't attempt local browser
         show_dialog=False,
     )
-    return Spotify(auth_manager=auth)
+
+    # Handle callback: ?code=...
+    params = st.query_params
+    if "code" in params:
+        code = params["code"]
+        try:
+            token_info = auth.get_access_token(code, as_dict=True)
+        except TypeError:
+            token_info = auth.get_access_token(code)  # older spotipy returns dict
+        st.session_state[TOKEN_INFO] = token_info
+        st.query_params.clear()
+        st.rerun()
+
+    # Token present?
+    token_info = st.session_state.get(TOKEN_INFO)
+    if token_info:
+        try:
+            if auth.is_token_expired(token_info):
+                token_info = auth.refresh_access_token(token_info["refresh_token"])
+                st.session_state[TOKEN_INFO] = token_info
+        except Exception:
+            # Token invalid/expired; force fresh login
+            st.session_state.pop(TOKEN_INFO, None)
+            st.warning("Session expired — please log in with Spotify again.")
+            st.rerun()
+        return Spotify(auth=token_info["access_token"])
+
+    # No token yet → show login button
+    auth_url = auth.get_authorize_url()
+    st.title("Swpify — Spotify Liked Songs")
+    st.write("Click below to connect your Spotify account.")
+    st.link_button("🔐 Log in with Spotify", auth_url, use_container_width=True)
+    st.stop()
 
 
 # ----------------------------- Spotify helpers ----------------------------- #
@@ -125,8 +164,7 @@ def ensure_playlist(sp: Spotify, name: str) -> str:
     created = sp.user_playlist_create(me, name, public=False, description="Created by Swpify")
     return created["id"]
 
-def fetch_all_liked_ids(sp: Spotify, status: Optional[st.delta_generator.DeltaGenerator] = None,
-                        bar: Optional[st.delta_generator.DeltaGenerator] = None) -> List[str]:
+def fetch_all_liked_ids(sp: Spotify, status=None, bar=None) -> List[str]:
     ids: List[str] = []
     offset = 0
     total = None
@@ -147,21 +185,20 @@ def fetch_all_liked_ids(sp: Spotify, status: Optional[st.delta_generator.DeltaGe
             break
     return ids
 
-def apply_filters(sp: Spotify, ids: List[str], term: str, artist: str, year: str,
-                  status: Optional[st.delta_generator.DeltaGenerator] = None,
-                  bar: Optional[st.delta_generator.DeltaGenerator] = None) -> List[str]:
+def apply_filters(sp: Spotify, ids: List[str], term: str, artist: str, year: str, status=None, bar=None) -> List[str]:
     term = (term or "").strip().lower()
     artist = (artist or "").strip().lower()
     year = (year or "").strip()
     if not (term or artist or year):
         return ids
-    filt: List[str] = []
+
+    out: List[str] = []
     chunks = [ids[i:i+50] for i in range(0, len(ids), 50)]
     total = max(1, len(chunks))
     for i, chunk in enumerate(chunks, 1):
         tracks = sp.tracks(chunk)["tracks"]
         for tr in tracks:
-            if not tr: 
+            if not tr:
                 continue
             ok = True
             if term:
@@ -178,12 +215,12 @@ def apply_filters(sp: Spotify, ids: List[str], term: str, artist: str, year: str
                 y = (tr.get("album", {}).get("release_date","") or "")[:4]
                 ok &= (y == year)
             if ok and tr.get("id"):
-                filt.append(tr["id"])
+                out.append(tr["id"])
         if status:
             status.write(f"Filtering… **{i}/{total}**")
         if bar:
             bar.progress(min(i / total, 1.0))
-    return filt
+    return out
 
 def build_queue(sp: Spotify, *, shuffle: bool, term: str, artist: str, year: str) -> int:
     ss = st.session_state
@@ -191,8 +228,7 @@ def build_queue(sp: Spotify, *, shuffle: bool, term: str, artist: str, year: str
     bar = st.progress(0.0)
     with st.spinner("Building your queue…"):
         liked = fetch_all_liked_ids(sp, status=status, bar=bar)
-        # drop already seen
-        liked = [tid for tid in liked if tid not in ss[SEEN]]
+        liked = [tid for tid in liked if tid not in ss[SEEN]]  # drop already processed
         if term or artist or year:
             status.write("Filtering…")
             bar.progress(0.0)
@@ -242,8 +278,7 @@ def options(sp: Spotify):
         keepers_name = st.text_input("Keepers playlist name", value=DEFAULT_KEEPERS)
         favs_name = st.text_input("Favourites playlist name", value=DEFAULT_FAVS)
 
-        if st.button("Build / Refresh queue", type="primary", use_container_width=False):
-            # Ensure helper playlists exist
+        if st.button("Build / Refresh queue", type="primary"):
             if ss.get(KEEPERS_ID) is None:
                 ss[KEEPERS_ID] = ensure_playlist(sp, keepers_name or DEFAULT_KEEPERS)
             if ss.get(FAVS_ID) is None:
@@ -357,12 +392,9 @@ def troubleshoot(sp: Spotify):
                 except Exception as e:
                     st.error("Auth failed."); st.exception(e)
         with c2:
-            if st.button("Force re-auth (clear token)"):
-                try:
-                    Path(".cache_swpify_token").unlink(missing_ok=True)
-                    st.success("Token cache cleared. Click any button to re-auth.")
-                except Exception as e:
-                    st.error(f"Could not clear cache: {e}")
+            if st.button("Force re-auth (clear session token)"):
+                st.session_state.pop(TOKEN_INFO, None)
+                st.success("Session token cleared. Reload the page and log in again.")
         with c3:
             if st.button("Quick fetch 1 track"):
                 try:
@@ -380,7 +412,9 @@ def troubleshoot(sp: Spotify):
 # ----------------------------- Main ----------------------------- #
 def main():
     init_state()
-    sp = get_spotify_client()
+
+    # In-app OAuth (no console prompt), returns ready Spotify client
+    sp = ensure_spotify_client()
 
     header(sp)
     options(sp)
