@@ -1,13 +1,12 @@
 """
 Swpify — Swipe your Spotify Liked Songs (Streamlit + Spotipy)
 
-What it does
-------------
-• Swipe through Liked Songs with: KEEP / REMOVE / SKIP / KEEP→Keepers / ⭐ FAVOURITE.
-• Undo last action, hotkeys, filters, shuffle, progress & ETA, CSV export.
-• Live progress while building the queue (loading + filtering stages).
-• Built-in Troubleshoot panel to verify Spotify auth and clear token cache.
-• Works with Streamlit Cloud secrets or local .env.
+This version:
+• No dark-theme feature at all (removed).
+• Shows total liked song count (cached) under the title every time.
+• Swipe actions: KEEP / REMOVE / SKIP / KEEP→Keepers / ⭐ FAVOURITE + Undo.
+• Filters, shuffle, progress & ETA, CSV export.
+• Troubleshoot panel to verify Spotify auth and clear token cache.
 
 Streamlit Secrets (Cloud)
 -------------------------
@@ -98,7 +97,6 @@ def load_state() -> Dict:
         "last_action": None,
         "queue_built_total": 0,
         "session_start": 0.0,
-        "theme_dark": False,
         "swiped_today": 0,
         "swiped_day": datetime.utcnow().strftime("%Y-%m-%d"),
     }
@@ -173,14 +171,13 @@ def fetch_all_liked_ids(
     offset = 0
     total = None
 
-    # yield an immediate status line so users see action
     if status:
         status.write("Loading liked songs…")
 
     while True:
         batch = sp_call(lambda: sp.current_user_saved_tracks(limit=PAGE_SIZE, offset=offset))
         if total is None:
-            total = max(1, batch.get("total", 0))  # avoid div by zero
+            total = max(1, batch.get("total", 0))
         items = batch.get("items", [])
         if not items:
             break
@@ -256,21 +253,17 @@ def build_queue(
     """Build the swipe queue (with progress UI if provided). Returns (queued_count, total_seen_plus_queued)."""
     state = load_state()
 
-    # Stage 1: load all liked IDs with progress
     liked_ids = fetch_all_liked_ids(sp, progress=progress, status=status)
-
-    # Drop already seen
     liked_ids = [tid for tid in liked_ids if tid not in state["seen"]]
 
-    # Stage 2: filtering (if any)
     if any(filters.values()):
         if progress:
             progress.progress(0.0)
         liked_ids = apply_filters_with_progress(sp, liked_ids, filters, progress=progress, status=status)
 
-    # Shuffle + save
     if shuffle:
         random.shuffle(liked_ids)
+
     state["queue"] = liked_ids
     state["queue_built_total"] = len(liked_ids) + len(state["seen"])
     state["session_start"] = time.time()
@@ -288,34 +281,6 @@ def get_track(sp: Spotify, tid: str) -> Optional[dict]:
         return None
 
 
-# ---------- UI helpers ----------
-def render_track_card(tr: dict) -> None:
-    name = tr.get("name", "Unknown")
-    artists = ", ".join(a["name"] for a in tr.get("artists", []))
-    album = tr.get("album", {}).get("name", "")
-    images = tr.get("album", {}).get("images", [])
-    art_url = images[0]["url"] if images else None
-    preview = tr.get("preview_url")
-
-    col1, col2 = st.columns([1, 2], gap="large")
-    with col1:
-        if art_url:
-            st.image(art_url, use_container_width=True)
-        else:
-            st.write("(no artwork)")
-    with col2:
-        st.markdown(f"### {name}\n**{artists}**\n\n_{album}_")
-        if preview:
-            st.audio(preview)
-        else:
-            st.caption("No 30s preview available for this track.")
-        dur_ms = tr.get("duration_ms") or 0
-        mins = dur_ms // 60000
-        secs = (dur_ms % 60000) // 1000
-        st.caption(f"Duration: {mins}:{secs:02d} • Popularity: {tr.get('popularity', '–')}")
-        st.link_button("Open in Spotify", tr.get("external_urls", {}).get("spotify", "#"))
-
-
 def action_remove(sp: Spotify, tid: str):                   sp_call(lambda: sp.current_user_saved_tracks_delete([tid]))
 def action_readd(sp: Spotify, tid: str):                    sp_call(lambda: sp.current_user_saved_tracks_add([tid]))
 def action_add_to_playlist(sp: Spotify, tid: str, pid: str): sp_call(lambda: sp.playlist_add_items(pid, [tid]))
@@ -328,9 +293,25 @@ def fast_head_count(sp: Spotify) -> int:
     return batch.get("total", 0)
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def get_total_liked_cached() -> Optional[int]:
+    """Cached helper so the banner count appears quickly and isn't re-polled on every rerun."""
+    try:
+        sp = get_spotify_client()
+        return fast_head_count(sp)
+    except Exception:
+        return None
+
+
 # ---------- App ----------
 st.set_page_config(page_title="Swpify — Spotify Liked Songs", page_icon="💚", layout="centered")
 st.title("Swpify — Spotify Liked Songs")
+
+# Show total liked count every time (cached)
+total_cached = get_total_liked_cached()
+if total_cached is not None:
+    st.caption(f"Your library: approximately **{total_cached:,}** Liked Songs.")
+
 st.caption("Swipe to keep, remove, or file songs to Keepers / Favourites. Built with Streamlit + Spotipy.")
 
 cid, secret, redirect = load_env()
@@ -341,36 +322,13 @@ if not (cid and secret and redirect):
 sp = get_spotify_client()
 state = load_state()
 
-# Sidebar: theme + daily counter
-with st.sidebar:
-    dark = st.checkbox("🌓 Dark theme", value=state.get("theme_dark", False))
-    if dark != state.get("theme_dark"):
-        state["theme_dark"] = dark
-        save_state(state)
-        st.rerun()
-
-    st.markdown("---")
-    today = datetime.utcnow().strftime("%Y-%m-%d")
-    if state.get("swiped_day") != today:
-        state["swiped_day"] = today
-        state["swiped_today"] = 0
-        save_state(state)
-    st.metric("Swiped today", state.get("swiped_today", 0))
-
-# Dark theme CSS
-if state.get("theme_dark"):
-    st.markdown(
-        """
-        <style>
-        html, body, [data-testid="stAppViewContainer"] { background:#0e1117 !important; color:#e5e7eb !important; }
-        .stButton>button, .stDownloadButton>button { background:#1f2937 !important; color:#e5e7eb !important; border:1px solid #334155 !important; }
-        .stTextInput>div>div>input, .stTextArea textarea { background:#111827 !important; color:#e5e7eb !important; }
-        .stExpander { background:#0b1220 !important; }
-        audio { width: 100%; }
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
+# Daily swipe counter (kept)
+today = datetime.utcnow().strftime("%Y-%m-%d")
+if state.get("swiped_day") != today:
+    state["swiped_day"] = today
+    state["swiped_today"] = 0
+    save_state(state)
+st.write(f"**Swiped today:** {state.get('swiped_today', 0)}")
 
 # Hotkeys
 components.html(
@@ -490,11 +448,9 @@ with st.expander("🔧 Troubleshoot (Spotify connection)"):
 # If nothing queued yet
 if not state.get("queue"):
     st.info("No queue yet — click **Build/Refresh Queue** above to begin.")
-    try:
-        total_est = fast_head_count(sp)
-        st.caption(f"You currently have approximately **{total_est:,}** Liked Songs.")
-    except Exception:
-        pass
+    # We already render total above; keep a gentle reminder here:
+    if total_cached is not None:
+        st.caption(f"(Library total cached: **{total_cached:,}** liked songs.)")
     st.stop()
 
 # Current track
@@ -505,6 +461,33 @@ if not track:
     state["queue"].pop(0)
     save_state(state)
     st.rerun()
+
+# Card + “filter to this artist” helper
+def render_track_card(tr: dict) -> None:
+    name = tr.get("name", "Unknown")
+    artists = ", ".join(a["name"] for a in tr.get("artists", []))
+    album = tr.get("album", {}).get("name", "")
+    images = tr.get("album", {}).get("images", [])
+    art_url = images[0]["url"] if images else None
+    preview = tr.get("preview_url")
+
+    col1, col2 = st.columns([1, 2], gap="large")
+    with col1:
+        if art_url:
+            st.image(art_url, use_container_width=True)
+        else:
+            st.write("(no artwork)")
+    with col2:
+        st.markdown(f"### {name}\n**{artists}**\n\n_{album}_")
+        if preview:
+            st.audio(preview)
+        else:
+            st.caption("No 30s preview available for this track.")
+        dur_ms = tr.get("duration_ms") or 0
+        mins = dur_ms // 60000
+        secs = (dur_ms % 60000) // 1000
+        st.caption(f"Duration: {mins}:{secs:02d} • Popularity: {tr.get('popularity', '–')}")
+        st.link_button("Open in Spotify", tr.get("external_urls", {}).get("spotify", "#"))
 
 render_track_card(track)
 curr_artists = ", ".join(a["name"] for a in track.get("artists", []))
@@ -528,9 +511,7 @@ elif hotkey_action == "favourite": favourite_clicked = True
 elif hotkey_action == "skip":      skip_clicked = True
 
 def record_action(a: str):
-    seen = state.get("seen", {})
-    seen[current_id] = {"action": a, "ts": now_iso()}
-    state["seen"] = seen
+    state["seen"][current_id] = {"action": a, "ts": now_iso()}
     state["last_action"] = {"track_id": current_id, "action": a}
     # daily metric
     today = datetime.utcnow().strftime("%Y-%m-%d")
@@ -670,4 +651,3 @@ with st.expander("🧹 Utilities"):
             STATE_FILE.unlink()
         st.query_params.clear()
         st.success("Local state cleared. Reload the page.")
-
