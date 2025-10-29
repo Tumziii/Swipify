@@ -1,11 +1,8 @@
-# --- Core dependencies ---
 streamlit==1.38.0
 spotipy==2.23.0
 pandas==2.2.2
 requests==2.31.0
 python-dotenv==1.0.1
-
-# --- Optional enhancements ---
-Pillow==10.3.0         # For displaying album art
-numpy==1.26.4          # Used by pandas internally
-altair==5.3.0          # For charts (if used later)
+Pillow==10.3.0
+numpy==1.26.4
+altair==5.3.0
