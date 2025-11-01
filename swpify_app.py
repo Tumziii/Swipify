@@ -1,12 +1,12 @@
 from __future__ import annotations
 import datetime as dt
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import List, Optional, Tuple
 
 import streamlit as st
-import pandas as pd
 import spotipy
 from spotipy.oauth2 import SpotifyOAuth
+import streamlit.components.v1 as components
 
 
 # --------------------------- Config --------------------------- #
@@ -16,52 +16,69 @@ st.set_page_config(
     layout="wide",
 )
 
-# ---------- CSS (mobile-first, compact-friendly) ---------- #
+
+# ---------- CSS (tighter, mobile-first; compact makes it extra tight) ---------- #
 def base_css(compact: bool = False) -> str:
     return f"""
 <style>
-/* Base scale */
-html, body, [class*="css"] {{ font-size: {14 if compact else 16}px; }}
+/* Slightly smaller base font; compact is extra small */
+html, body, [class*="css"] {{
+  font-size: {13 if compact else 15}px;
+}}
 
-/* Card */
+/* Cards */
 .swpify-card {{
   background: rgba(255,255,255,0.03);
   border: 1px solid rgba(255,255,255,0.08);
-  border-radius: 16px;
-  padding: {8 if compact else 10}px;
+  border-radius: 14px;
+  padding: {6 if compact else 8}px;
   margin-top: {6 if compact else 8}px;
 }}
 
-/* Artwork wrapper controls the image height */
+/* Artwork wrapper caps image height so everything fits on one screen */
 .swpify-art img {{
-  border-radius: 12px;
+  border-radius: 10px;
   width: 100%;
   height: auto;
-  max-height: {38 if compact else 45}vh;   /* cap for small screens */
+  max-height: {28 if compact else 34}vh;  /* smaller than before */
   object-fit: cover;
+}}
+
+/* Reduce column gap */
+.block-container .stColumns {{
+  gap: {6 if compact else 8}px !important;
 }}
 
 /* Buttons */
 .stButton > button {{
   width: 100%;
-  padding: {8 if compact else 10}px {10 if compact else 12}px;
-  font-size: {14 if compact else 16}px;
-  border-radius: {8 if compact else 10}px;
+  padding: {7 if compact else 9}px {9 if compact else 11}px;
+  font-size: {13 if compact else 15}px;
+  border-radius: {7 if compact else 9}px;
   margin-top: {6 if compact else 8}px;
 }}
 
-/* Progress and messages */
+/* Footer / queue note */
 .swpify-footer {{
-  background: rgba(125, 143, 175, 0.12);
+  background: rgba(125,143,175,0.10);
   border: 1px solid rgba(255,255,255,0.08);
-  padding: 12px;
-  border-radius: 10px;
-  margin-top: 10px;
+  padding: 10px;
+  border-radius: 9px;
+  margin-top: 8px;
+  font-size: {12 if compact else 13}px;
+  opacity: 0.95;
 }}
 
-/* Stack cols on small phones */
-@media (max-width: 600px) {{
-  .stColumns, .stColumn {{ display: block !important; width: 100% !important; }}
+/* Help badge for shortcuts */
+.swpify-hotkeys {{
+  font-size: {12 if compact else 13}px;
+  opacity: 0.9;
+  margin-top: 2px;
+}}
+
+/* Stack columns on small phones */
+@media (max-width: 640px) {{
+  .stColumns, .stColumn {{ display:block !important; width:100% !important; }}
 }}
 </style>
 """
@@ -80,7 +97,6 @@ class Keys:
     compact: str = "compact_desktop"
     total_liked: str = "total_liked"
 
-
 K = Keys()
 
 def init_state():
@@ -94,9 +110,6 @@ def init_state():
     SS.setdefault(K.compact, False)
     SS.setdefault(K.total_liked, 0)
 
-def today_str() -> str:
-    return dt.date.today().isoformat()
-
 def date_from_str(s: str) -> Optional[dt.date]:
     s = (s or "").strip().replace("-", "/")
     try:
@@ -108,13 +121,12 @@ def date_from_str(s: str) -> Optional[dt.date]:
 
 # --------------------------- Spotify Auth --------------------------- #
 def auth() -> Optional[spotipy.Spotify]:
-    """Return an authorized Spotify client or None if not authorized yet."""
     cid = st.secrets.get("SPOTIPY_CLIENT_ID")
     sec = st.secrets.get("SPOTIPY_CLIENT_SECRET")
     redir = st.secrets.get("SPOTIPY_REDIRECT_URI")
 
     if not all([cid, sec, redir]):
-        st.error("Missing Spotify secrets. Please set SPOTIPY_CLIENT_ID / SECRET / REDIRECT_URI in Streamlit secrets.")
+        st.error("Missing Spotify secrets. Set SPOTIPY_CLIENT_ID / SECRET / REDIRECT_URI in Streamlit secrets.")
         return None
 
     oauth = SpotifyOAuth(
@@ -126,7 +138,6 @@ def auth() -> Optional[spotipy.Spotify]:
         show_dialog=False,
     )
 
-    # If token already in session, refresh when needed
     token_info = st.session_state.get(K.token)
     if token_info and oauth.is_token_expired(token_info):
         try:
@@ -135,7 +146,6 @@ def auth() -> Optional[spotipy.Spotify]:
         except Exception:
             token_info = None
 
-    # If no token yet, try to complete the code flow using URL params
     if not token_info:
         params = st.experimental_get_query_params()
         code = params.get("code", [None])[0]
@@ -143,18 +153,14 @@ def auth() -> Optional[spotipy.Spotify]:
             try:
                 token_info = oauth.get_access_token(code, as_dict=True)
                 st.session_state[K.token] = token_info
-                # Clean URL (remove ?code=..)
-                st.experimental_set_query_params()
+                st.experimental_set_query_params()  # clean URL
             except Exception:
                 token_info = None
 
-    # If still no token, show login button
     if not token_info:
-        with st.container():
-            st.title("Swpify — Spotify Liked Songs")
-            st.write("Click below to connect your Spotify account.")
-            auth_url = oauth.get_authorize_url()
-            st.link_button("🔐 Log in with Spotify", auth_url, use_container_width=True)
+        st.title("Swpify — Spotify Liked Songs")
+        st.write("Click below to connect your Spotify account.")
+        st.link_button("🔐 Log in with Spotify", oauth.get_authorize_url(), use_container_width=True)
         return None
 
     return spotipy.Spotify(auth=token_info["access_token"])
@@ -176,7 +182,6 @@ def create_or_get_playlist(sp: spotipy.Spotify, name: str) -> str:
             if pl["name"].strip().lower() == name.strip().lower():
                 return pl["id"]
         results = sp.next(results) if results.get("next") else None
-    # Create
     new_pl = sp.user_playlist_create(user, name, public=False, description="Curated by Swpify")
     return new_pl["id"]
 
@@ -188,12 +193,11 @@ def remove_like(sp: spotipy.Spotify, track_id: str):
     sp.current_user_saved_tracks_delete([track_id])
 
 def fetch_liked_with_dates(sp: spotipy.Spotify) -> List[Tuple[str, dt.date]]:
-    """Return list of (track_id, added_at_date)."""
     out: List[Tuple[str, dt.date]] = []
     limit = 50
     offset = 0
     while True:
-        items = sp.current_user_saved_tracks(limit=50, offset=offset)
+        items = sp.current_user_saved_tracks(limit=limit, offset=offset)
         for it in items.get("items", []):
             tid = (it.get("track") or {}).get("id")
             added = it.get("added_at", "")
@@ -223,7 +227,6 @@ def options_block():
             "Favourites playlist name",
             value=st.session_state[K.favourites_pl],
         )
-
         left, right = st.columns(2)
         with left:
             st.session_state[K.added_start] = st.text_input("Added After", value=st.session_state[K.added_start])
@@ -242,7 +245,6 @@ def options_block():
     return build_btn
 
 def render_track(sp: spotipy.Spotify, track_id: str) -> bool:
-    """Show a single track card; return True if shown, False if failed."""
     try:
         tr = sp.track(track_id)
     except Exception:
@@ -262,7 +264,7 @@ def render_track(sp: spotipy.Spotify, track_id: str) -> bool:
     link = (tr.get("external_urls") or {}).get("spotify")
 
     st.markdown('<div class="swpify-card">', unsafe_allow_html=True)
-    c1, c2 = st.columns([1, 1.4], vertical_alignment="top")
+    c1, c2 = st.columns([1, 1.2], vertical_alignment="top")  # a bit tighter than before
     with c1:
         if cover:
             st.markdown('<div class="swpify-art">', unsafe_allow_html=True)
@@ -284,20 +286,50 @@ def render_track(sp: spotipy.Spotify, track_id: str) -> bool:
     return True
 
 def act_and_next(action: str, sp: spotipy.Spotify, track_id: str):
-    """Perform action then advance to next item."""
     if action == "fav":
         add_to_playlist(sp, track_id, st.session_state[K.favourites_pl])
     elif action == "rm":
         remove_like(sp, track_id)
-    # Mark as processed
+    # mark processed
     st.session_state[K.seen].add(track_id)
     st.session_state[K.swiped] += 1
-    # Pop current and rerun
     if st.session_state[K.queue] and st.session_state[K.queue][0] == track_id:
         st.session_state[K.queue].pop(0)
     st.experimental_rerun()
 
+def inject_hotkeys():
+    """
+    Capture J / K / L and click the corresponding Streamlit buttons by text.
+    - J => Keep
+    - K => Favourite
+    - L => Remove (unlike)
+    """
+    components.html(
+        """
+<script>
+(function() {
+  function clickByStartsWith(label) {
+    const btns = Array.from(window.parent.document.querySelectorAll('button'));
+    const target = btns.find(b => (b.innerText || '').trim().toLowerCase().startsWith(label));
+    if (target) { target.click(); }
+  }
+
+  window.addEventListener('keydown', (e) => {
+    const k = (e.key || '').toLowerCase();
+    if (k === 'j') { e.preventDefault(); clickByStartsWith('✅ keep'); }
+    if (k === 'k') { e.preventDefault(); clickByStartsWith('⭐ favourite'); }
+    if (k === 'l') { e.preventDefault(); clickByStartsWith('🗑️ remove'); }
+  }, true);
+})();
+</script>
+        """,
+        height=0,
+    )
+    st.caption("**Hotkeys:** J = Keep, K = Favourite, L = Remove", help="Use your keyboard to fly through tracks.")
+    st.markdown('<div class="swpify-hotkeys"></div>', unsafe_allow_html=True)
+
 def actions_row(sp: spotipy.Spotify, track_id: str):
+    inject_hotkeys()
     a, b, c = st.columns(3)
     with a:
         if st.button("✅ Keep", use_container_width=True):
@@ -310,11 +342,10 @@ def actions_row(sp: spotipy.Spotify, track_id: str):
             act_and_next("rm", sp, track_id)
 
 def build_controls(sp: spotipy.Spotify):
-    build_clicked = options_block()
     st.markdown(base_css(st.session_state[K.compact]), unsafe_allow_html=True)
+    build_clicked = options_block()
 
     if build_clicked:
-        # Build queue safely (no nested expanders)
         with st.spinner("Fetching liked songs and building your queue…"):
             all_items = fetch_liked_with_dates(sp)
             st.session_state[K.total_liked] = current_user_total_likes(sp)
@@ -322,7 +353,6 @@ def build_controls(sp: spotipy.Spotify):
             start = date_from_str(st.session_state[K.added_start])
             end = date_from_str(st.session_state[K.added_end])
             q: List[str] = []
-
             for tid, added in all_items:
                 if start and added < start:
                     continue
@@ -330,7 +360,6 @@ def build_controls(sp: spotipy.Spotify):
                     continue
                 if tid not in st.session_state[K.seen]:
                     q.append(tid)
-
             st.session_state[K.queue] = q
 
         st.success(f"Queue ready: {len(st.session_state[K.queue])} songs")
@@ -341,7 +370,7 @@ def footer():
     st.markdown(
         f"""
 <div class="swpify-footer">
-  🎵 {"No queue yet — tap **Build / Refresh Queue** above." if q_len == 0 else f"{q_len} in queue."}
+  🎵 {"No queue yet — tap <b>Build / Refresh Queue</b> above." if q_len == 0 else f"{q_len} in queue."}
   &nbsp;&nbsp; Total liked: <b>{total}</b>
 </div>
 """,
@@ -356,7 +385,6 @@ def main():
     if not sp:
         return
 
-    # fetch total liked for progress baseline
     if not st.session_state.get(K.total_liked):
         st.session_state[K.total_liked] = current_user_total_likes(sp)
 
@@ -368,7 +396,6 @@ def main():
         footer()
         return
 
-    # Show first item in queue
     current_id = q[0]
     ok = render_track(sp, current_id)
     if not ok:
