@@ -21,12 +21,9 @@ st.set_page_config(
 def base_css(compact: bool = False) -> str:
     return f"""
 <style>
-/* Slightly smaller base font; compact is extra small */
 html, body, [class*="css"] {{
   font-size: {13 if compact else 15}px;
 }}
-
-/* Cards */
 .swpify-card {{
   background: rgba(255,255,255,0.03);
   border: 1px solid rgba(255,255,255,0.08);
@@ -34,22 +31,16 @@ html, body, [class*="css"] {{
   padding: {6 if compact else 8}px;
   margin-top: {6 if compact else 8}px;
 }}
-
-/* Artwork wrapper caps image height so everything fits on one screen */
 .swpify-art img {{
   border-radius: 10px;
   width: 100%;
   height: auto;
-  max-height: {28 if compact else 34}vh;  /* smaller than before */
+  max-height: {28 if compact else 34}vh;
   object-fit: cover;
 }}
-
-/* Reduce column gap */
 .block-container .stColumns {{
   gap: {6 if compact else 8}px !important;
 }}
-
-/* Buttons */
 .stButton > button {{
   width: 100%;
   padding: {7 if compact else 9}px {9 if compact else 11}px;
@@ -57,8 +48,6 @@ html, body, [class*="css"] {{
   border-radius: {7 if compact else 9}px;
   margin-top: {6 if compact else 8}px;
 }}
-
-/* Footer / queue note */
 .swpify-footer {{
   background: rgba(125,143,175,0.10);
   border: 1px solid rgba(255,255,255,0.08);
@@ -68,15 +57,11 @@ html, body, [class*="css"] {{
   font-size: {12 if compact else 13}px;
   opacity: 0.95;
 }}
-
-/* Help badge for shortcuts */
 .swpify-hotkeys {{
   font-size: {12 if compact else 13}px;
   opacity: 0.9;
   margin-top: 2px;
 }}
-
-/* Stack columns on small phones */
 @media (max-width: 640px) {{
   .stColumns, .stColumn {{ display:block !important; width:100% !important; }}
 }}
@@ -147,13 +132,15 @@ def auth() -> Optional[spotipy.Spotify]:
             token_info = None
 
     if not token_info:
-        params = st.experimental_get_query_params()
-        code = params.get("code", [None])[0]
+        params = dict(st.query_params)  # new API
+        code = params.get("code")
+        if isinstance(code, list):  # defensive (older shapes)
+            code = code[0]
         if code:
             try:
-                token_info = oauth.get_access_token(code, as_dict=True)
+                token_info = oauth.get_access_token(code, as_dict=True)  # deprecation is fine here
                 st.session_state[K.token] = token_info
-                st.experimental_set_query_params()  # clean URL
+                st.query_params.clear()  # clean URL
             except Exception:
                 token_info = None
 
@@ -240,7 +227,7 @@ def options_block():
         logout = st.button("Log out (clear token)", use_container_width=True)
         if logout:
             st.session_state.pop(K.token, None)
-            st.experimental_rerun()
+            st.rerun()
 
     return build_btn
 
@@ -264,7 +251,7 @@ def render_track(sp: spotipy.Spotify, track_id: str) -> bool:
     link = (tr.get("external_urls") or {}).get("spotify")
 
     st.markdown('<div class="swpify-card">', unsafe_allow_html=True)
-    c1, c2 = st.columns([1, 1.2], vertical_alignment="top")  # a bit tighter than before
+    c1, c2 = st.columns([1, 1.2], vertical_alignment="top")
     with c1:
         if cover:
             st.markdown('<div class="swpify-art">', unsafe_allow_html=True)
@@ -290,35 +277,34 @@ def act_and_next(action: str, sp: spotipy.Spotify, track_id: str):
         add_to_playlist(sp, track_id, st.session_state[K.favourites_pl])
     elif action == "rm":
         remove_like(sp, track_id)
-    # mark processed
     st.session_state[K.seen].add(track_id)
     st.session_state[K.swiped] += 1
     if st.session_state[K.queue] and st.session_state[K.queue][0] == track_id:
         st.session_state[K.queue].pop(0)
-    st.experimental_rerun()
+    st.rerun()
 
 def inject_hotkeys():
     """
-    Capture J / K / L and click the corresponding Streamlit buttons by text.
-    - J => Keep
-    - K => Favourite
-    - L => Remove (unlike)
+    J = Keep, K = Favourite, L = Remove (unlike)
+    Robust matching: click first button whose text CONTAINS the keyword
+    (emoji / extra spaces won't break it).
     """
     components.html(
         """
 <script>
 (function() {
-  function clickByStartsWith(label) {
+  function clickByIncludes(keyword) {
     const btns = Array.from(window.parent.document.querySelectorAll('button'));
-    const target = btns.find(b => (b.innerText || '').trim().toLowerCase().startsWith(label));
+    const key = keyword.toLowerCase();
+    const target = btns.find(b => (b.innerText || '').toLowerCase().includes(key));
     if (target) { target.click(); }
   }
-
   window.addEventListener('keydown', (e) => {
     const k = (e.key || '').toLowerCase();
-    if (k === 'j') { e.preventDefault(); clickByStartsWith('✅ keep'); }
-    if (k === 'k') { e.preventDefault(); clickByStartsWith('⭐ favourite'); }
-    if (k === 'l') { e.preventDefault(); clickByStartsWith('🗑️ remove'); }
+    if (['input','textarea'].includes((document.activeElement || {}).tagName?.toLowerCase())) return;
+    if (k === 'j') { e.preventDefault(); clickByIncludes('keep'); }
+    if (k === 'k') { e.preventDefault(); clickByIncludes('favourite') || clickByIncludes('favorite'); }
+    if (k === 'l') { e.preventDefault(); clickByIncludes('remove'); }
   }, true);
 })();
 </script>
@@ -402,7 +388,7 @@ def main():
         st.warning("Could not load this track; skipped.")
         st.session_state[K.seen].add(current_id)
         st.session_state[K.queue].pop(0)
-        st.experimental_rerun()
+        st.rerun()
         return
 
     actions_row(sp, current_id)
