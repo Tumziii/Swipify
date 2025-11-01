@@ -2,7 +2,6 @@
 # Swpify — Spotify Liked Songs with Compact Mode + Date Filter + Progress Bar
 
 import os
-import time
 from datetime import datetime
 from typing import Dict, List, Optional
 
@@ -28,11 +27,12 @@ st.set_page_config(
     page_title="Swpify",
     page_icon="🎧",
     layout="wide",
-    initial_sidebar_state="collapsed"
+    initial_sidebar_state="collapsed",
 )
 
 # ---------------------- Custom CSS ---------------------- #
-st.markdown("""
+st.markdown(
+    """
 <style>
 html, body, [class*=css] { font-size: 18px; }
 
@@ -44,7 +44,7 @@ html, body, [class*=css] { font-size: 18px; }
   border-radius: 12px;
 }
 
-/* Compact toggle button style */
+/* Compact toggle style */
 .compact-btn > button {
   font-size: 16px !important;
   padding: 6px 10px !important;
@@ -65,17 +65,18 @@ html, body, [class*=css] { font-size: 18px; }
 /* Mobile stacking */
 @media (max-width: 500px) {
   .stColumns, .stColumn { display: block !important; width: 100% !important; }
-  .st-emotion-cache-ocqkz7 { width: 100% !important; }
   .swpify-actions .stButton { margin-bottom: 10px; }
-  .swpify-header { font-size: 1.4rem; }
 }
 </style>
-""", unsafe_allow_html=True)
+""",
+    unsafe_allow_html=True,
+)
 
 # ------------------------ Secrets & OAuth ---------------------- #
 CLIENT_ID = st.secrets["SPOTIPY_CLIENT_ID"]
 CLIENT_SECRET = st.secrets["SPOTIPY_CLIENT_SECRET"]
 REDIRECT_URI = st.secrets["SPOTIPY_REDIRECT_URI"]
+
 
 def spotify_client() -> Optional[Spotify]:
     auth = SpotifyOAuth(
@@ -92,6 +93,7 @@ def spotify_client() -> Optional[Spotify]:
         st.error(f"Could not connect to Spotify: {e}")
         return None
 
+
 # ------------------------ Session Keys ------------------------- #
 def init_state():
     defaults = {
@@ -102,12 +104,14 @@ def init_state():
         "favourites_id": None,
         "liked_total": 0,
         "swiped_today": 0,
-        "added_filter_start": None,
-        "added_filter_end": None,
+        "added_filter_start": None,  # date
+        "added_filter_end": None,    # date
         "compact_mode": False,
+        "build_request": False,      # trigger building outside expander
     }
     for k, v in defaults.items():
         st.session_state.setdefault(k, v)
+
 
 # ------------------------ Spotify helpers ---------------------- #
 def total_liked(sp: Spotify) -> int:
@@ -115,6 +119,7 @@ def total_liked(sp: Spotify) -> int:
         return sp.current_user_saved_tracks(limit=1).get("total", 0)
     except Exception:
         return 0
+
 
 def fetch_liked_with_dates(sp: Spotify) -> List[Dict]:
     """Return list of liked tracks with added_at timestamps."""
@@ -126,16 +131,20 @@ def fetch_liked_with_dates(sp: Spotify) -> List[Dict]:
         if not items:
             break
         for item in items:
-            if item.get("track") and item["track"].get("id"):
-                results.append({
-                    "id": item["track"]["id"],
-                    "track": item["track"],
-                    "added_at": item.get("added_at")
-                })
+            tr = item.get("track")
+            if tr and tr.get("id"):
+                results.append(
+                    {
+                        "id": tr["id"],
+                        "track": tr,
+                        "added_at": item.get("added_at"),
+                    }
+                )
         offset += len(items)
         if offset >= batch.get("total", 0):
             break
     return results
+
 
 def ensure_playlist(sp: Spotify, name: str) -> str:
     uid = sp.current_user()["id"]
@@ -148,8 +157,11 @@ def ensure_playlist(sp: Spotify, name: str) -> str:
             results = sp.next(results)
         else:
             break
-    created = sp.user_playlist_create(uid, name, public=False, description="Created by Swpify")
+    created = sp.user_playlist_create(
+        uid, name, public=False, description="Created by Swpify"
+    )
     return created["id"]
+
 
 def add_to_playlist(sp: Spotify, track_id: str, playlist_id: str):
     try:
@@ -157,11 +169,13 @@ def add_to_playlist(sp: Spotify, track_id: str, playlist_id: str):
     except Exception:
         pass
 
+
 def unlike(sp: Spotify, track_id: str):
     try:
         sp.current_user_saved_tracks_delete([track_id])
     except Exception:
         pass
+
 
 def relike(sp: Spotify, track_id: str):
     try:
@@ -169,9 +183,11 @@ def relike(sp: Spotify, track_id: str):
     except Exception:
         pass
 
+
 # -------------------------- UI elements -------------------------- #
 def header():
     st.markdown(f"### {APP_TITLE}")
+
 
 def progress_bar():
     total = st.session_state["liked_total"]
@@ -182,13 +198,13 @@ def progress_bar():
     else:
         st.progress(0, text="0% complete")
 
+
 def build_controls(sp: Spotify):
     with st.expander("⚙️ Options", expanded=True):
         c1, c2 = st.columns(2)
         with c1:
             st.session_state["favourites_name"] = st.text_input(
-                "Favourites playlist name",
-                st.session_state["favourites_name"]
+                "Favourites playlist name", st.session_state["favourites_name"]
             )
         with c2:
             st.session_state["compact_mode"] = st.toggle("🖥️ Compact Desktop Mode")
@@ -196,26 +212,48 @@ def build_controls(sp: Spotify):
         c3, c4 = st.columns(2)
         with c3:
             st.session_state["added_filter_start"] = st.date_input(
-                "Added After", st.session_state["added_filter_start"] or datetime(2020, 1, 1)
+                "Added After",
+                st.session_state["added_filter_start"] or datetime(2020, 1, 1).date(),
             )
         with c4:
             st.session_state["added_filter_end"] = st.date_input(
-                "Added Before", st.session_state["added_filter_end"] or datetime.now()
+                "Added Before",
+                st.session_state["added_filter_end"] or datetime.now().date(),
             )
 
+        # NOTE: We only set a flag in the expander to avoid nested containers.
         if st.button("Build / Refresh Queue", use_container_width=True):
-            with st.status("Fetching liked songs…", expanded=True):
-                all_liked = fetch_liked_with_dates(sp)
-                total = len(all_liked)
-                start = st.session_state["added_filter_start"]
-                end = st.session_state["added_filter_end"]
-                filtered = [
-                    t for t in all_liked
-                    if start <= datetime.fromisoformat(t["added_at"].replace("Z", "+00:00")) <= end
-                ]
-                st.session_state["queue"] = [t["id"] for t in filtered]
-                st.session_state["liked_total"] = total
-                st.success(f"Queue ready: {len(filtered)} of {total} songs match date filter.")
+            st.session_state["build_request"] = True
+
+
+def do_build_queue(sp: Spotify):
+    """Runs outside the expander so we can safely use spinner/toast."""
+    if not st.session_state.get("build_request"):
+        return
+    st.session_state["build_request"] = False
+
+    with st.spinner("Fetching liked songs…"):
+        all_liked = fetch_liked_with_dates(sp)
+        total = len(all_liked)
+
+        start = st.session_state["added_filter_start"]
+        end = st.session_state["added_filter_end"]
+        # Compare by date object
+        filtered = []
+        for t in all_liked:
+            added_at = t.get("added_at")
+            try:
+                d = datetime.fromisoformat(added_at.replace("Z", "+00:00")).date()
+            except Exception:
+                continue
+            if start <= d <= end:
+                filtered.append(t)
+
+        st.session_state["queue"] = [t["id"] for t in filtered]
+        st.session_state["liked_total"] = total
+
+    st.toast(f"Queue ready: {len(filtered)} of {total} songs match date filter ✅")
+
 
 def track_card(sp: Spotify, track_id: str):
     tr = sp.track(track_id)
@@ -241,7 +279,8 @@ def track_card(sp: Spotify, track_id: str):
     st.caption(f"Duration: {mins}:{secs:02d} • Popularity: {popularity}")
     if preview:
         st.audio(preview)
-    st.markdown('</div>', unsafe_allow_html=True)
+    st.markdown("</div>", unsafe_allow_html=True)
+
 
 def actions(sp: Spotify, track_id: str):
     compact = st.session_state["compact_mode"]
@@ -260,7 +299,9 @@ def actions(sp: Spotify, track_id: str):
 
     with c2:
         if st.button("⭐ Favourite", use_container_width=True):
-            pid = st.session_state.get("favourites_id") or ensure_playlist(sp, st.session_state["favourites_name"])
+            pid = st.session_state.get("favourites_id") or ensure_playlist(
+                sp, st.session_state["favourites_name"]
+            )
             st.session_state["favourites_id"] = pid
             add_to_playlist(sp, track_id, pid)
             st.session_state["seen"][track_id] = "favourite"
@@ -278,11 +319,11 @@ def actions(sp: Spotify, track_id: str):
 
     with c4:
         if st.button("⏭ Skip", use_container_width=True):
-            # move track to end
             q = st.session_state["queue"]
             q.append(q.pop(0))
             st.session_state["seen"][track_id] = "skip"
             st.rerun()
+
 
 def undo(sp: Spotify):
     if not st.session_state["seen"]:
@@ -295,6 +336,7 @@ def undo(sp: Spotify):
     st.session_state["seen"].pop(last_id)
     st.toast("↩️ Undone last action.")
 
+
 # ---------------------------- Main ----------------------------- #
 def main():
     init_state()
@@ -305,13 +347,19 @@ def main():
     header()
     st.sidebar.metric("Swiped today", st.session_state["swiped_today"])
     progress_bar()
+
+    # Controls inside expander
     build_controls(sp)
+    # Build queue outside (no nested containers)
+    do_build_queue(sp)
 
     q = st.session_state["queue"]
     if not q:
         total = total_liked(sp)
         st.session_state["liked_total"] = total
-        st.info(f"🎵 No queue yet — tap **Build / Refresh Queue** above. Total liked: {total}")
+        st.info(
+            f"🎵 No queue yet — tap **Build / Refresh Queue** above. Total liked: {total}"
+        )
         st.stop()
 
     track_card(sp, q[0])
@@ -325,6 +373,7 @@ def main():
             st.rerun()
     with col2:
         st.caption(f"Remaining in queue: **{len(q)}**")
+
 
 if __name__ == "__main__":
     main()
